@@ -70,6 +70,38 @@ namespace AltWindowCycleLogic
         return requiredModifiers != 0 && (downModifiers & requiredModifiers) == requiredModifiers;
     }
 
+    // Maps a virtual-key code to the modifier bit it drives, or 0 for non-modifier keys.
+    constexpr unsigned int ModifierFromVirtualKey(unsigned int vk)
+    {
+        switch (vk)
+        {
+        case VK_MENU:
+        case VK_LMENU:
+        case VK_RMENU:
+            return ModifierAlt;
+        case VK_CONTROL:
+        case VK_LCONTROL:
+        case VK_RCONTROL:
+            return ModifierCtrl;
+        case VK_SHIFT:
+        case VK_LSHIFT:
+        case VK_RSHIFT:
+            return ModifierShift;
+        case VK_LWIN:
+        case VK_RWIN:
+            return ModifierWin;
+        default:
+            return 0;
+        }
+    }
+
+    // True when a KEY_UP of `vk` releases one of the modifiers holding the cycle
+    // open, which commits the selected window immediately.
+    constexpr bool IsHoldModifierRelease(unsigned int vk, unsigned int holdModifiers)
+    {
+        return (ModifierFromVirtualKey(vk) & holdModifiers) != 0;
+    }
+
     inline int WrapIndex(int index, int count)
     {
         if (count <= 0)

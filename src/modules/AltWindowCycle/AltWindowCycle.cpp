@@ -415,27 +415,41 @@ static void ForceForeground(HWND hwnd)
 // WM_AWC_HOTKEY: wParam = forward flag (0/1), lParam = held modifier mask.
 static const UINT WM_AWC_HOTKEY = WM_APP + 1;
 static const UINT WM_AWC_CANCEL = WM_APP + 2;
+static const UINT WM_AWC_RELEASE = WM_APP + 3;
 
 static DWORD g_uiThreadId = 0;
 
 // Escape has to cancel the overlay, but the overlay is WS_EX_NOACTIVATE and never
-// receives keyboard focus. A low-level hook installed only while the overlay is
-// visible keeps Escape out of the runner's global hotkey table, so PowerToys never
-// claims Alt+Escape (a Windows shell shortcut) while the module sits idle.
-static HHOOK g_escapeHook = nullptr;
+// receives keyboard focus. A low-level hook installed only while a cycle is in
+// progress keeps Escape out of the runner's global hotkey table, so PowerToys never
+// claims Alt+Escape (a Windows shell shortcut) while the module sits idle. The same
+// hook reports the KEY_UP of a held modifier so the selected window is activated
+// right away, without waiting for the overlay to be shown or for the poll timer.
+static HHOOK g_cycleKeyHook = nullptr;
 
-static LRESULT CALLBACK EscapeHookProc(int code, WPARAM wParam, LPARAM lParam)
+// Modifier mask that holds the current cycle open. Only touched on the UI thread,
+// which is also the thread the low-level hook callback runs on.
+static unsigned int g_cycleHoldModifiers = 0;
+
+static LRESULT CALLBACK CycleKeyHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    if (code == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
+    const auto* keyInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    if (code == HC_ACTION && keyInfo && g_uiThreadId)
     {
-        const auto* keyInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-
-        // Keep this callback bounded: teardown runs on the UI thread's own message
-        // loop rather than inline, so the OS low-level hook timeout is never at risk.
-        if (keyInfo && keyInfo->vkCode == VK_ESCAPE && g_uiThreadId &&
+        // Keep this callback bounded: teardown and window activation run on the UI
+        // thread's own message loop rather than inline, so the OS low-level hook
+        // timeout is never at risk.
+        if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && keyInfo->vkCode == VK_ESCAPE &&
             PostThreadMessageW(g_uiThreadId, WM_AWC_CANCEL, 0, 0))
         {
             return 1;
+        }
+
+        // The modifier KEY_UP itself is passed through untouched.
+        if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) &&
+            AltWindowCycleLogic::IsHoldModifierRelease(keyInfo->vkCode, g_cycleHoldModifiers))
+        {
+            PostThreadMessageW(g_uiThreadId, WM_AWC_RELEASE, 0, 0);
         }
     }
 
@@ -451,18 +465,26 @@ public:
     void Shutdown();
     void OnHotkey(bool forward, unsigned int holdModifiers);
     void OnCancel();
+    void OnRelease();
 
 private:
-    enum class St { Idle, Visible };
+    // Pending: a cycle is in progress but the overlay has not been shown yet.
+    enum class St { Idle, Pending, Visible };
 
     static const UINT_PTR TIMER_ID = 1;
     static const UINT TIMER_MS = 25;
+    // Delays the overlay so a quick tap-and-release switches windows without the
+    // overlay flashing up, and so overlay rendering never delays the switch.
+    static const UINT_PTR SHOW_TIMER_ID = 2;
+    static const UINT SHOW_DELAY_MS = 100;
 
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
     void OnTick();
+    void OnShowDelayElapsed();
     void Commit();
     void Cancel();
+    void EndCycle();
     void ShowOverlayWindow();
     void HideOverlayWindow();
     void SetSelection(int index);
@@ -471,8 +493,8 @@ private:
     void ComputeLayout(const RECT& work, int& x, int& y, int& panelW, int& panelH);
     void RegisterThumbnails();
     void UnregisterThumbnails();
-    void InstallEscapeHook();
-    void RemoveEscapeHook();
+    void InstallCycleKeyHook();
+    void RemoveCycleKeyHook();
     void EnsureFont();
 
     RECT TileRect(int index) const;
@@ -563,7 +585,7 @@ bool Switcher::Init(HINSTANCE instance)
 
 void Switcher::Shutdown()
 {
-    RemoveEscapeHook();
+    RemoveCycleKeyHook();
     UnregisterThumbnails();
     if (thumbHost)
     {
@@ -578,6 +600,7 @@ void Switcher::Shutdown()
     if (overlay)
     {
         KillTimer(overlay, TIMER_ID);
+        KillTimer(overlay, SHOW_TIMER_ID);
         DestroyWindow(overlay);
         overlay = nullptr;
     }
@@ -642,19 +665,37 @@ void Switcher::OnHotkey(bool forward, unsigned int holdModifiers)
             return;
 
         selected = firstHotkey.selected;
-        ShowOverlayWindow();
-        state = St::Visible;
+        state = St::Pending;
+
+        // Arm the KEY_UP watch before sampling the modifiers so a release between
+        // the two cannot be missed.
+        g_cycleHoldModifiers = activeHoldModifiers;
+        InstallCycleKeyHook();
+
+        // A quick tap may already be over by the time this message is processed.
+        if (!AltWindowCycleLogic::AreRequiredModifiersDown(activeHoldModifiers, CurrentModifiersDown()))
+        {
+            Commit();
+            return;
+        }
+
+        // The poll timer is a fallback in case the KEY_UP never reaches the hook.
         SetTimer(overlay, TIMER_ID, TIMER_MS, nullptr);
+        SetTimer(overlay, SHOW_TIMER_ID, SHOW_DELAY_MS, nullptr);
     }
     else
     {
         selected = AltWindowCycleLogic::WrapIndex(forward ? selected + 1 : selected - 1, static_cast<int>(windows.size()));
-        SetSelection(selected);
+        if (state == St::Visible)
+            SetSelection(selected);
     }
 }
 
 void Switcher::OnTick()
 {
+    if (state == St::Idle)
+        return;
+
     if (!AltWindowCycleLogic::AreRequiredModifiersDown(activeHoldModifiers, CurrentModifiersDown()))
     {
         Commit();
@@ -662,20 +703,55 @@ void Switcher::OnTick()
     }
 }
 
+void Switcher::OnShowDelayElapsed()
+{
+    KillTimer(overlay, SHOW_TIMER_ID);
+    if (state != St::Pending)
+        return;
+
+    if (!AltWindowCycleLogic::AreRequiredModifiersDown(activeHoldModifiers, CurrentModifiersDown()))
+    {
+        Commit();
+        return;
+    }
+
+    ShowOverlayWindow();
+    state = St::Visible;
+}
+
 void Switcher::OnCancel()
 {
-    if (state == St::Visible)
+    if (state != St::Idle)
     {
         Cancel();
     }
 }
 
-void Switcher::Commit()
+void Switcher::OnRelease()
+{
+    if (state != St::Idle)
+    {
+        Commit();
+    }
+}
+
+// Tears down the in-progress cycle: cancels any pending overlay show, hides the
+// overlay if it is already visible, and stops watching the keyboard.
+void Switcher::EndCycle()
 {
     KillTimer(overlay, TIMER_ID);
+    KillTimer(overlay, SHOW_TIMER_ID);
+    RemoveCycleKeyHook();
+    g_cycleHoldModifiers = 0;
     if (state == St::Visible)
         HideOverlayWindow();
     anchorWindow = nullptr;
+    state = St::Idle;
+}
+
+void Switcher::Commit()
+{
+    EndCycle();
 
     if (selected >= 0 && selected < static_cast<int>(windows.size()))
     {
@@ -683,16 +759,11 @@ void Switcher::Commit()
         if (IsWindow(target))
             ForceForeground(target);
     }
-    state = St::Idle;
 }
 
 void Switcher::Cancel()
 {
-    KillTimer(overlay, TIMER_ID);
-    if (state == St::Visible)
-        HideOverlayWindow();
-    anchorWindow = nullptr;
-    state = St::Idle;
+    EndCycle();
 }
 
 // ---- overlay window ----------------------------------------------------------
@@ -816,12 +887,10 @@ void Switcher::ShowOverlayWindow()
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetWindowPos(thumbHost, overlay, 0, 0, 0, 0,
                  SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-    InstallEscapeHook();
 }
 
 void Switcher::HideOverlayWindow()
 {
-    RemoveEscapeHook();
     ShowWindow(overlay, SW_HIDE);
     ShowWindow(thumbHost, SW_HIDE);
     UnregisterThumbnails();
@@ -829,20 +898,20 @@ void Switcher::HideOverlayWindow()
     titles.clear();
 }
 
-void Switcher::InstallEscapeHook()
+void Switcher::InstallCycleKeyHook()
 {
-    if (!g_escapeHook)
+    if (!g_cycleKeyHook)
     {
-        g_escapeHook = SetWindowsHookExW(WH_KEYBOARD_LL, EscapeHookProc, nullptr, 0);
+        g_cycleKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, CycleKeyHookProc, nullptr, 0);
     }
 }
 
-void Switcher::RemoveEscapeHook()
+void Switcher::RemoveCycleKeyHook()
 {
-    if (g_escapeHook)
+    if (g_cycleKeyHook)
     {
-        UnhookWindowsHookEx(g_escapeHook);
-        g_escapeHook = nullptr;
+        UnhookWindowsHookEx(g_cycleKeyHook);
+        g_cycleKeyHook = nullptr;
     }
 }
 
@@ -1627,6 +1696,11 @@ LRESULT CALLBACK Switcher::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 self->OnTick();
                 return 0;
             }
+            if (wParam == SHOW_TIMER_ID)
+            {
+                self->OnShowDelayElapsed();
+                return 0;
+            }
             break;
         case WM_ERASEBKGND:
             return 1;
@@ -1774,6 +1848,10 @@ static DWORD WINAPI UIThreadProc(LPVOID param)
         else if (msg.hwnd == nullptr && msg.message == WM_AWC_CANCEL)
         {
             g_switcher.OnCancel();
+        }
+        else if (msg.hwnd == nullptr && msg.message == WM_AWC_RELEASE)
+        {
+            g_switcher.OnRelease();
         }
         else
         {

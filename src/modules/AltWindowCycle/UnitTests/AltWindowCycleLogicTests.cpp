@@ -420,5 +420,38 @@ namespace AltWindowCycleUnitTests
                 AltWindowCycleLogic::ModifierAlt | AltWindowCycleLogic::ModifierCtrl | AltWindowCycleLogic::ModifierWin;
             Assert::AreEqual(expected, AltWindowCycleLogic::StableHoldModifiers(0xFFu));
         }
+
+        TEST_METHOD(ModifierFromVirtualKeyMapsGenericAndSidedModifierKeys)
+        {
+            Assert::AreEqual(AltWindowCycleLogic::ModifierAlt, AltWindowCycleLogic::ModifierFromVirtualKey(VK_MENU));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierAlt, AltWindowCycleLogic::ModifierFromVirtualKey(VK_LMENU));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierAlt, AltWindowCycleLogic::ModifierFromVirtualKey(VK_RMENU));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierCtrl, AltWindowCycleLogic::ModifierFromVirtualKey(VK_CONTROL));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierCtrl, AltWindowCycleLogic::ModifierFromVirtualKey(VK_LCONTROL));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierCtrl, AltWindowCycleLogic::ModifierFromVirtualKey(VK_RCONTROL));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierShift, AltWindowCycleLogic::ModifierFromVirtualKey(VK_SHIFT));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierShift, AltWindowCycleLogic::ModifierFromVirtualKey(VK_LSHIFT));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierShift, AltWindowCycleLogic::ModifierFromVirtualKey(VK_RSHIFT));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierWin, AltWindowCycleLogic::ModifierFromVirtualKey(VK_LWIN));
+            Assert::AreEqual(AltWindowCycleLogic::ModifierWin, AltWindowCycleLogic::ModifierFromVirtualKey(VK_RWIN));
+            Assert::AreEqual(0u, AltWindowCycleLogic::ModifierFromVirtualKey(VK_OEM_3));
+            Assert::AreEqual(0u, AltWindowCycleLogic::ModifierFromVirtualKey(VK_ESCAPE));
+        }
+
+        TEST_METHOD(IsHoldModifierReleaseOnlyMatchesHeldModifiers)
+        {
+            const unsigned int altHold = AltWindowCycleLogic::ModifierAlt;
+            Assert::IsTrue(AltWindowCycleLogic::IsHoldModifierRelease(VK_LMENU, altHold));
+            Assert::IsTrue(AltWindowCycleLogic::IsHoldModifierRelease(VK_RMENU, altHold));
+            Assert::IsFalse(AltWindowCycleLogic::IsHoldModifierRelease(VK_LSHIFT, altHold));
+            Assert::IsFalse(AltWindowCycleLogic::IsHoldModifierRelease(VK_OEM_3, altHold));
+
+            const unsigned int ctrlAltHold = AltWindowCycleLogic::ModifierCtrl | AltWindowCycleLogic::ModifierAlt;
+            Assert::IsTrue(AltWindowCycleLogic::IsHoldModifierRelease(VK_LCONTROL, ctrlAltHold));
+            Assert::IsTrue(AltWindowCycleLogic::IsHoldModifierRelease(VK_MENU, ctrlAltHold));
+            Assert::IsFalse(AltWindowCycleLogic::IsHoldModifierRelease(VK_LWIN, ctrlAltHold));
+
+            Assert::IsFalse(AltWindowCycleLogic::IsHoldModifierRelease(VK_LMENU, 0));
+        }
     };
 }

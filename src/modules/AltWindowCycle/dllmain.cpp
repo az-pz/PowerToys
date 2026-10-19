@@ -43,7 +43,7 @@ namespace
     const unsigned char DEFAULT_BACKTICK_VK = 0xC0;
 
     // The configurable hotkeys stay in Settings UI order. Escape is handled by a
-    // scoped low-level hook inside the module while the overlay is visible, so it
+    // scoped low-level hook inside the module while a cycle is in progress, so it
     // deliberately does not appear here.
     enum HotkeyId : size_t
     {
